@@ -8,6 +8,8 @@ from pathlib import Path
 from torch.utils.data import Dataset,DataLoader
 from torchvision import transforms
 from torch.backends import cudnn
+import torchprune
+from torchinfo import summary  # Thư viện để đo FLOPs và tham số
 
 DATA_ROOT_PATH = Path("E:/pv/WORKING/ECG_main_folder/ECG_Classification/data")
 MODEL_PATH = Path("E:/pv/WORKING/ECG_main_folder/ECG_Classification/model_save/ecg_model.pth")
@@ -108,6 +110,18 @@ def apply_pruning_mask(model, masks):
 
     return model
 
+def print_model_stats(model, input_size, note=""):
+    info = summary(model, input_size=input_size, verbose=0)
+    print(f"\n{note}Model stats:")
+    print(f"  Parameters: {info.total_params:,}")
+    print(f"  FLOPs: {info.total_mult_adds:,}")
+    # Tính kích thước file model (MB)
+    torch.save(model.state_dict(), "temp.pth")
+    import os
+    size_mb = os.path.getsize("temp.pth") / (1024 * 1024)
+    os.remove("temp.pth")
+    print(f"  Model size: {size_mb:.2f} MB")
+
 def main():
     # Xác định thiết bị: nếu có GPU thì dùng, không thì dùng CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,6 +131,8 @@ def main():
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
 
+    # In thông tin mô hình trước khi pruning   # In thông số mô hình trước pruning
+    print_model_stats(model, input_size=(1, 1, 100, 100), note="Before pruning")
     # Tạo DataLoader cho dữ liệu huấn luyện
     transform = transforms.Compose([
         transforms.Resize((100, 100)),
@@ -125,14 +141,25 @@ def main():
     train_dataset = MyDataset(root_dir=DATA_ROOT_PATH/'train_images', transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    # Tính toán Fisher information
-    fisher_info = compute_fisher_information(model, train_loader)
 
-    # Prune và tạo mask
-    masks = fisher_prune_and_mask(model, fisher_info)
+    # Fisher pruning với torch-pruning, chỉ áp dụng cho Conv2d
+    example_inputs = torch.randn(1, 1, 100, 100).to(device)
+    imp = tp.importance.FisherImportance()
+    ignored_layers = [m for m in model.modules() if not isinstance(m, nn.Conv2d)]
+    pruner = tp.pruner.MetaPruner(
+        model,
+        example_inputs,
+        importance=imp,
+        iterative_steps=1,
+        pruning_ratio=0.3,  # Prune 30%
+        ignored_layers=ignored_layers
+    )
+    pruner.step()  # Tự động prune và tái cấu trúc model
 
-    # Áp dụng mask vào mô hình
-    pruned_model = apply_pruning_mask(model, masks)
+    print_model_stats(model, input_size=(1, 1, 100, 100), note="After pruning")
 
-    # Lưu mô hình đã được pruning
-    torch.save(pruned_model.state_dict(), COMPACT_MODEL_PATH)
+    torch.save(model.state_dict(), COMPACT_MODEL_PATH)
+    print(f"\nPruned model saved to: {COMPACT_MODEL_PATH}")
+
+if __name__ == "__main__":
+    main()
